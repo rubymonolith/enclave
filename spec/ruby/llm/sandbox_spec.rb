@@ -258,4 +258,173 @@ RSpec.describe Ruby::LLM::Sandbox do
       expect(result).to eq("=> 1024")
     end
   end
+
+  describe "tools (module bridging)" do
+    module TestTools
+      def double(n)
+        n * 2
+      end
+
+      def greet(name)
+        "Hello, #{name}!"
+      end
+
+      def info
+        { name: "test", version: 1, tags: ["a", "b"] }
+      end
+
+      def echo_all(a, b, c)
+        [a, b, c]
+      end
+
+      def returns_nil
+        nil
+      end
+
+      def returns_true
+        true
+      end
+
+      def returns_false
+        false
+      end
+
+      def returns_float
+        3.14
+      end
+
+      def raise_error
+        raise "something went wrong"
+      end
+
+      def bad_return
+        Object.new
+      end
+    end
+
+    module MoreTools
+      def triple(n)
+        n * 3
+      end
+    end
+
+    let(:sandbox_with_tools) { described_class.new(tools: TestTools) }
+
+    after { sandbox_with_tools.close unless sandbox_with_tools.closed? }
+
+    it "calls a simple tool method with an integer arg" do
+      result = sandbox_with_tools.eval("double(21)")
+      expect(result.value).to eq("42")
+      expect(result.error?).to be false
+    end
+
+    it "calls a tool method with a string arg" do
+      result = sandbox_with_tools.eval('greet("World")')
+      expect(result.value).to eq('"Hello, World!"')
+      expect(result.error?).to be false
+    end
+
+    it "returns a hash with nested arrays" do
+      result = sandbox_with_tools.eval("info()")
+      expect(result.error?).to be false
+      # mruby inspect uses " => " with spaces
+      expect(result.value).to include('"name" => "test"')
+      expect(result.value).to include('"tags" => ["a", "b"]')
+    end
+
+    it "converts symbol keys to strings" do
+      result = sandbox_with_tools.eval('info()["name"]')
+      expect(result.value).to eq('"test"')
+    end
+
+    it "passes multiple args" do
+      result = sandbox_with_tools.eval('echo_all(1, "two", 3.0)')
+      expect(result.value).to eq('[1, "two", 3.0]')
+    end
+
+    it "returns nil" do
+      result = sandbox_with_tools.eval("returns_nil()")
+      expect(result.value).to eq("nil")
+      expect(result.error?).to be false
+    end
+
+    it "returns true" do
+      result = sandbox_with_tools.eval("returns_true()")
+      expect(result.value).to eq("true")
+    end
+
+    it "returns false" do
+      result = sandbox_with_tools.eval("returns_false()")
+      expect(result.value).to eq("false")
+    end
+
+    it "returns a float" do
+      result = sandbox_with_tools.eval("returns_float()")
+      expect(result.value).to eq("3.14")
+    end
+
+    it "captures CRuby exceptions as mruby errors" do
+      result = sandbox_with_tools.eval("raise_error()")
+      expect(result.error?).to be true
+      expect(result.error).to include("something went wrong")
+    end
+
+    it "rejects unsupported return types with a TypeError" do
+      result = sandbox_with_tools.eval("bad_return()")
+      expect(result.error?).to be true
+      expect(result.error).to include("unsupported type")
+      expect(result.error).to include("Object")
+    end
+
+    it "passes hash args from mruby to CRuby" do
+      result = sandbox_with_tools.eval('echo_all({"a" => 1}, [2, 3], nil)')
+      expect(result.value).to eq('[{"a" => 1}, [2, 3], nil]')
+    end
+
+    it "passes boolean and nil args" do
+      result = sandbox_with_tools.eval("echo_all(true, false, nil)")
+      expect(result.value).to eq("[true, false, nil]")
+    end
+
+    it "supports multiple modules via expose" do
+      sandbox_with_tools.expose(MoreTools)
+      result = sandbox_with_tools.eval("triple(7)")
+      expect(result.value).to eq("21")
+
+      # Original tools still work
+      result = sandbox_with_tools.eval("double(5)")
+      expect(result.value).to eq("10")
+    end
+
+    it "survives reset!" do
+      result = sandbox_with_tools.eval("double(10)")
+      expect(result.value).to eq("20")
+
+      sandbox_with_tools.reset!
+
+      result = sandbox_with_tools.eval("double(10)")
+      expect(result.value).to eq("20")
+      expect(result.error?).to be false
+    end
+
+    it "can use tool results in further computations" do
+      result = sandbox_with_tools.eval("double(double(5))")
+      expect(result.value).to eq("20")
+    end
+
+    it "passes tools: keyword to constructor" do
+      sb = described_class.new(tools: TestTools)
+      result = sb.eval("double(3)")
+      expect(result.value).to eq("6")
+      sb.close
+    end
+
+    it "works with .open and tools" do
+      described_class.open(tools: TestTools) do |sb|
+        result = sb.eval("double(100)")
+        expect(result.value).to eq("200")
+      end
+    end
+  end
+
 end

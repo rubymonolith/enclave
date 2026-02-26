@@ -14,8 +14,10 @@
 #include <mruby/variable.h>
 #include <mruby/error.h>
 #include <mruby/array.h>
+#include <mruby/hash.h>
 #include <mruby/irep.h>
 #include <mruby/internal.h>
+#include <mruby/class.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -76,16 +78,295 @@ output_buf_append(output_buf_t *ob, const char *str, size_t slen)
 /* Sandbox internal state                                              */
 /* ------------------------------------------------------------------ */
 
+#define SANDBOX_MAX_FUNCTIONS 64
+
 struct sandbox_state {
     mrb_state    *mrb;
     mrb_ccontext *cxt;
     unsigned int  stack_keep;
     int           arena_idx;
     output_buf_t  output;
+
+    /* Tool callback */
+    sandbox_callback_func_t callback;
+    void                   *callback_userdata;
+
+    /* Registered function names (survive reset) */
+    char *func_names[SANDBOX_MAX_FUNCTIONS];
+    int   func_count;
 };
 
-/* Key for storing output buffer pointer in mruby globals */
+/* Key for storing pointers in mruby globals */
 #define OUTPUT_BUF_KEY "$__sandbox_output_buf__"
+#define SANDBOX_STATE_KEY "$__sandbox_state__"
+
+/* ------------------------------------------------------------------ */
+/* sandbox_value_t helpers                                             */
+/* ------------------------------------------------------------------ */
+
+void
+sandbox_value_free(sandbox_value_t *val)
+{
+    if (!val) return;
+    switch (val->type) {
+    case SANDBOX_VALUE_STRING:
+        if (val->as.str.ptr) { free(val->as.str.ptr); val->as.str.ptr = NULL; }
+        break;
+    case SANDBOX_VALUE_ARRAY:
+        for (size_t i = 0; i < val->as.arr.len; i++) {
+            sandbox_value_free(&val->as.arr.items[i]);
+        }
+        free(val->as.arr.items);
+        val->as.arr.items = NULL;
+        break;
+    case SANDBOX_VALUE_HASH:
+        for (size_t i = 0; i < val->as.hash.len; i++) {
+            sandbox_value_free(&val->as.hash.keys[i]);
+            sandbox_value_free(&val->as.hash.vals[i]);
+        }
+        free(val->as.hash.keys);
+        free(val->as.hash.vals);
+        val->as.hash.keys = NULL;
+        val->as.hash.vals = NULL;
+        break;
+    default:
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* mruby → sandbox_value_t conversion                                 */
+/* ------------------------------------------------------------------ */
+
+/* Returns 0 on success, -1 on unsupported type (sets errbuf) */
+static int
+mrb_to_sandbox_value(mrb_state *mrb, mrb_value v, sandbox_value_t *out, char *errbuf, size_t errbuf_size)
+{
+    memset(out, 0, sizeof(*out));
+
+    if (mrb_nil_p(v)) {
+        out->type = SANDBOX_VALUE_NIL;
+        return 0;
+    }
+    if (mrb_true_p(v)) {
+        out->type = SANDBOX_VALUE_TRUE;
+        return 0;
+    }
+    if (mrb_false_p(v)) {
+        out->type = SANDBOX_VALUE_FALSE;
+        return 0;
+    }
+    if (mrb_integer_p(v)) {
+        out->type = SANDBOX_VALUE_INTEGER;
+        out->as.i = (int64_t)mrb_integer(v);
+        return 0;
+    }
+    if (mrb_float_p(v)) {
+        out->type = SANDBOX_VALUE_FLOAT;
+        out->as.f = mrb_float(v);
+        return 0;
+    }
+    if (mrb_string_p(v)) {
+        out->type = SANDBOX_VALUE_STRING;
+        out->as.str.len = (size_t)RSTRING_LEN(v);
+        out->as.str.ptr = malloc(out->as.str.len + 1);
+        memcpy(out->as.str.ptr, RSTRING_PTR(v), out->as.str.len);
+        out->as.str.ptr[out->as.str.len] = '\0';
+        return 0;
+    }
+    if (mrb_symbol_p(v)) {
+        /* Symbol → String */
+        out->type = SANDBOX_VALUE_STRING;
+        mrb_int slen;
+        const char *sname = mrb_sym_name_len(mrb, mrb_symbol(v), &slen);
+        out->as.str.len = (size_t)slen;
+        out->as.str.ptr = malloc(out->as.str.len + 1);
+        memcpy(out->as.str.ptr, sname, out->as.str.len);
+        out->as.str.ptr[out->as.str.len] = '\0';
+        return 0;
+    }
+    if (mrb_array_p(v)) {
+        mrb_int alen = RARRAY_LEN(v);
+        out->type = SANDBOX_VALUE_ARRAY;
+        out->as.arr.len = (size_t)alen;
+        out->as.arr.items = calloc((size_t)alen, sizeof(sandbox_value_t));
+        for (mrb_int i = 0; i < alen; i++) {
+            if (mrb_to_sandbox_value(mrb, mrb_ary_entry(v, i),
+                                     &out->as.arr.items[i], errbuf, errbuf_size) != 0) {
+                /* Clean up already-converted items */
+                for (mrb_int j = 0; j < i; j++) {
+                    sandbox_value_free(&out->as.arr.items[j]);
+                }
+                free(out->as.arr.items);
+                out->as.arr.items = NULL;
+                return -1;
+            }
+        }
+        return 0;
+    }
+    if (mrb_hash_p(v)) {
+        mrb_value keys = mrb_hash_keys(mrb, v);
+        mrb_int hlen = RARRAY_LEN(keys);
+        out->type = SANDBOX_VALUE_HASH;
+        out->as.hash.len = (size_t)hlen;
+        out->as.hash.keys = calloc((size_t)hlen, sizeof(sandbox_value_t));
+        out->as.hash.vals = calloc((size_t)hlen, sizeof(sandbox_value_t));
+        for (mrb_int i = 0; i < hlen; i++) {
+            mrb_value k = mrb_ary_entry(keys, i);
+            mrb_value val = mrb_hash_get(mrb, v, k);
+            if (mrb_to_sandbox_value(mrb, k, &out->as.hash.keys[i], errbuf, errbuf_size) != 0 ||
+                mrb_to_sandbox_value(mrb, val, &out->as.hash.vals[i], errbuf, errbuf_size) != 0) {
+                for (mrb_int j = 0; j <= i; j++) {
+                    sandbox_value_free(&out->as.hash.keys[j]);
+                    sandbox_value_free(&out->as.hash.vals[j]);
+                }
+                free(out->as.hash.keys);
+                free(out->as.hash.vals);
+                out->as.hash.keys = NULL;
+                out->as.hash.vals = NULL;
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    /* Unsupported type */
+    mrb_value cls_name = mrb_obj_as_string(mrb, mrb_funcall_argv(mrb, mrb_obj_value(mrb_obj_class(mrb, v)),
+                           mrb_intern_lit(mrb, "name"), 0, NULL));
+    snprintf(errbuf, errbuf_size, "TypeError: unsupported type for sandbox: %s",
+             mrb_string_p(cls_name) ? RSTRING_PTR(cls_name) : "unknown");
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* sandbox_value_t → mruby conversion                                 */
+/* ------------------------------------------------------------------ */
+
+static mrb_value
+sandbox_value_to_mrb(mrb_state *mrb, const sandbox_value_t *val)
+{
+    switch (val->type) {
+    case SANDBOX_VALUE_NIL:
+        return mrb_nil_value();
+    case SANDBOX_VALUE_TRUE:
+        return mrb_true_value();
+    case SANDBOX_VALUE_FALSE:
+        return mrb_false_value();
+    case SANDBOX_VALUE_INTEGER:
+        return mrb_int_value(mrb, (mrb_int)val->as.i);
+    case SANDBOX_VALUE_FLOAT:
+        return mrb_float_value(mrb, (mrb_float)val->as.f);
+    case SANDBOX_VALUE_STRING:
+        return mrb_str_new(mrb, val->as.str.ptr, (mrb_int)val->as.str.len);
+    case SANDBOX_VALUE_ARRAY: {
+        mrb_value ary = mrb_ary_new_capa(mrb, (mrb_int)val->as.arr.len);
+        for (size_t i = 0; i < val->as.arr.len; i++) {
+            mrb_ary_push(mrb, ary, sandbox_value_to_mrb(mrb, &val->as.arr.items[i]));
+        }
+        return ary;
+    }
+    case SANDBOX_VALUE_HASH: {
+        mrb_value hash = mrb_hash_new_capa(mrb, (mrb_int)val->as.hash.len);
+        for (size_t i = 0; i < val->as.hash.len; i++) {
+            mrb_hash_set(mrb, hash,
+                sandbox_value_to_mrb(mrb, &val->as.hash.keys[i]),
+                sandbox_value_to_mrb(mrb, &val->as.hash.vals[i]));
+        }
+        return hash;
+    }
+    }
+    return mrb_nil_value();
+}
+
+/* ------------------------------------------------------------------ */
+/* Trampoline: single C function for all registered tool functions     */
+/* ------------------------------------------------------------------ */
+
+static sandbox_state_t *
+get_sandbox_state(mrb_state *mrb)
+{
+    mrb_value gv = mrb_gv_get(mrb, mrb_intern_cstr(mrb, SANDBOX_STATE_KEY));
+    if (mrb_nil_p(gv)) return NULL;
+    return (sandbox_state_t *)mrb_cptr(gv);
+}
+
+static mrb_value
+sandbox_function_trampoline(mrb_state *mrb, mrb_value self)
+{
+    sandbox_state_t *state = get_sandbox_state(mrb);
+    if (!state || !state->callback) {
+        mrb_raise(mrb, mrb_class_get(mrb, "RuntimeError"), "no tool callback registered");
+        return mrb_nil_value();
+    }
+
+    /* Get the method name from the call info */
+    const char *method_name = mrb_sym_name(mrb, mrb->c->ci->mid);
+
+    /* Get args */
+    mrb_int argc;
+    mrb_value *argv;
+    mrb_get_args(mrb, "*", &argv, &argc);
+
+    /* Convert mruby args → sandbox_value_t[] */
+    sandbox_value_t *sargs = NULL;
+    char errbuf[256];
+    errbuf[0] = '\0';
+
+    if (argc > 0) {
+        sargs = calloc((size_t)argc, sizeof(sandbox_value_t));
+        for (mrb_int i = 0; i < argc; i++) {
+            if (mrb_to_sandbox_value(mrb, argv[i], &sargs[i], errbuf, sizeof(errbuf)) != 0) {
+                /* Clean up already-converted args */
+                for (mrb_int j = 0; j < i; j++) {
+                    sandbox_value_free(&sargs[j]);
+                }
+                free(sargs);
+                mrb_raise(mrb, mrb_class_get(mrb, "TypeError"), errbuf);
+                return mrb_nil_value();
+            }
+        }
+    }
+
+    /* Call the CRuby callback */
+    sandbox_callback_result_t cb_result = state->callback(
+        method_name, sargs, (int)argc, state->callback_userdata);
+
+    /* Free the converted args */
+    for (mrb_int i = 0; i < argc; i++) {
+        sandbox_value_free(&sargs[i]);
+    }
+    free(sargs);
+
+    /* Check for error from callback */
+    if (cb_result.error) {
+        char *err_copy = strdup(cb_result.error);
+        free(cb_result.error);
+        sandbox_value_free(&cb_result.value);
+        mrb_raise(mrb, mrb_class_get(mrb, "RuntimeError"), err_copy);
+        free(err_copy);
+        return mrb_nil_value();
+    }
+
+    /* Convert result back to mruby */
+    mrb_value ret = sandbox_value_to_mrb(mrb, &cb_result.value);
+    sandbox_value_free(&cb_result.value);
+
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Register functions in mruby                                        */
+/* ------------------------------------------------------------------ */
+
+static void
+register_functions_in_mrb(sandbox_state_t *state)
+{
+    struct RClass *kernel = state->mrb->kernel_module;
+    for (int i = 0; i < state->func_count; i++) {
+        mrb_define_method(state->mrb, kernel, state->func_names[i],
+                          sandbox_function_trampoline, MRB_ARGS_ANY());
+    }
+}
 
 static output_buf_t *
 get_output_buf(mrb_state *mrb)
@@ -189,11 +470,18 @@ sandbox_setup_mrb(sandbox_state_t *state)
     mrb_gv_set(state->mrb, mrb_intern_cstr(state->mrb, OUTPUT_BUF_KEY),
                mrb_cptr_value(state->mrb, &state->output));
 
+    /* Store sandbox state pointer for trampoline access */
+    mrb_gv_set(state->mrb, mrb_intern_cstr(state->mrb, SANDBOX_STATE_KEY),
+               mrb_cptr_value(state->mrb, state));
+
     /* Override Kernel#print, define Kernel#puts, override Kernel#p */
     struct RClass *kernel = state->mrb->kernel_module;
     mrb_define_method(state->mrb, kernel, "print", sandbox_mrb_print, MRB_ARGS_ANY());
     mrb_define_method(state->mrb, kernel, "puts",  sandbox_mrb_puts,  MRB_ARGS_ANY());
     mrb_define_method(state->mrb, kernel, "p",     sandbox_mrb_p,     MRB_ARGS_ANY());
+
+    /* Re-register tool functions (survives reset) */
+    register_functions_in_mrb(state);
 
     /* Initialize _ variable (like mirb) */
     struct mrb_parser_state *parser = mrb_parse_string(state->mrb, "_=nil", state->cxt);
@@ -247,6 +535,9 @@ sandbox_state_free(sandbox_state_t *state)
         mrb_close(state->mrb);
     }
     output_buf_free(&state->output);
+    for (int i = 0; i < state->func_count; i++) {
+        free(state->func_names[i]);
+    }
     free(state);
 }
 
@@ -400,4 +691,32 @@ sandbox_result_free(sandbox_result_t *result)
     if (result->value) { free(result->value); result->value = NULL; }
     if (result->output) { free(result->output); result->output = NULL; }
     if (result->error) { free(result->error); result->error = NULL; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Tool callback API                                                   */
+/* ------------------------------------------------------------------ */
+
+void
+sandbox_state_set_callback(sandbox_state_t *state,
+                           sandbox_callback_func_t callback,
+                           void *userdata)
+{
+    state->callback = callback;
+    state->callback_userdata = userdata;
+}
+
+int
+sandbox_state_define_function(sandbox_state_t *state, const char *name)
+{
+    if (state->func_count >= SANDBOX_MAX_FUNCTIONS) return -1;
+
+    state->func_names[state->func_count] = strdup(name);
+    state->func_count++;
+
+    /* Register in the current mruby state */
+    struct RClass *kernel = state->mrb->kernel_module;
+    mrb_define_method(state->mrb, kernel, name,
+                      sandbox_function_trampoline, MRB_ARGS_ANY());
+    return 0;
 }
