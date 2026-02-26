@@ -26,6 +26,36 @@ module Ruby
         Result.new(value: value, output: output, error: error)
       end
 
+      def repl
+        require "readline"
+        buf = ""
+        prompt = "sandbox> "
+
+        puts "Ruby LLM Sandbox REPL (#{RUBY_ENGINE} host, mruby sandbox)"
+        puts "Type 'exit' or Ctrl-D to quit.\n\n"
+
+        while (line = Readline.readline(buf.empty? ? prompt : "     .. ", true))
+          break if buf.empty? && line.strip == "exit"
+
+          buf << line << "\n"
+          result = eval(buf)
+
+          if result.error? && result.error.match?(/SyntaxError.*unexpected.*\$end|unexpected end of file/i)
+            next # incomplete input, keep reading
+          end
+
+          print result.output unless result.output.empty?
+          if result.error?
+            puts "Error: #{result.error}"
+          else
+            puts "=> #{result.value}"
+          end
+          buf = ""
+        end
+
+        puts "\n" if line.nil? # clean newline on Ctrl-D
+      end
+
       def expose(obj)
         case obj
         when Module
