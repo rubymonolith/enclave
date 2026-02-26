@@ -26,10 +26,19 @@ module Ruby
         Result.new(value: value, output: output, error: error)
       end
 
-      def expose(mod)
-        @tool_context.extend(mod)
-        mod.instance_methods(false).each do |name|
-          _define_function(name.to_s)
+      def expose(obj)
+        case obj
+        when Module
+          @tool_context.extend(obj)
+          obj.instance_methods(false).each do |name|
+            _define_function(name.to_s)
+          end
+        else
+          obj.public_methods(false).each do |name|
+            target = obj
+            @tool_context.define_singleton_method(name) { |*args| target.public_send(name, *args) }
+            _define_function(name.to_s)
+          end
         end
         self
       end

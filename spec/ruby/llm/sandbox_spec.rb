@@ -427,4 +427,96 @@ RSpec.describe Ruby::LLM::Sandbox do
     end
   end
 
+  describe "tools (instance-based)" do
+    class FakeUser
+      attr_accessor :name, :email, :plan
+
+      def initialize(name:, email:, plan:)
+        @name = name
+        @email = email
+        @plan = plan
+      end
+    end
+
+    class AccountTools
+      def initialize(user)
+        @user = user
+      end
+
+      def user_info
+        { name: @user.name, email: @user.email, plan: @user.plan }
+      end
+
+      def change_plan(new_plan)
+        @user.plan = new_plan
+        { success: true, plan: @user.plan }
+      end
+
+      def upcase_name
+        @user.name.upcase
+      end
+    end
+
+    class BillingTools
+      def charge(amount)
+        { charged: amount }
+      end
+    end
+
+    let(:user) { FakeUser.new(name: "Jane Doe", email: "jane@example.com", plan: "basic") }
+    let(:sandbox_with_instance) { described_class.new(tools: AccountTools.new(user)) }
+
+    after { sandbox_with_instance.close unless sandbox_with_instance.closed? }
+
+    it "calls methods on the instance" do
+      result = sandbox_with_instance.eval("user_info()")
+      expect(result.error?).to be false
+      expect(result.value).to include('"name" => "Jane Doe"')
+      expect(result.value).to include('"plan" => "basic"')
+    end
+
+    it "mutates state through the instance" do
+      sandbox_with_instance.eval('change_plan("premium")')
+      expect(user.plan).to eq("premium")
+    end
+
+    it "returns the mutated state" do
+      result = sandbox_with_instance.eval('change_plan("premium")')
+      expect(result.value).to include('"plan" => "premium"')
+    end
+
+    it "calls methods that return strings" do
+      result = sandbox_with_instance.eval("upcase_name()")
+      expect(result.value).to eq('"JANE DOE"')
+    end
+
+    it "supports exposing multiple instances" do
+      sandbox_with_instance.expose(BillingTools.new)
+      result = sandbox_with_instance.eval("charge(999)")
+      expect(result.value).to include('"charged" => 999')
+
+      # Original tools still work
+      result = sandbox_with_instance.eval("user_info()")
+      expect(result.value).to include('"name" => "Jane Doe"')
+    end
+
+    it "survives reset!" do
+      result = sandbox_with_instance.eval("user_info()")
+      expect(result.error?).to be false
+
+      sandbox_with_instance.reset!
+
+      result = sandbox_with_instance.eval("user_info()")
+      expect(result.error?).to be false
+      expect(result.value).to include('"name" => "Jane Doe"')
+    end
+
+    it "works with .open" do
+      tools = AccountTools.new(user)
+      described_class.open(tools: tools) do |sb|
+        result = sb.eval("user_info()")
+        expect(result.value).to include('"name" => "Jane Doe"')
+      end
+    end
+  end
 end
