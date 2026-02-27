@@ -158,6 +158,61 @@ apply_discount(99)   #=> RuntimeError: discount must be 1-50%
 details()            # still works
 ```
 
+## Using with RubyLLM
+
+With standard tool calling, you'd write a separate tool class for every action:
+
+```ruby
+class Weather < RubyLLM::Tool
+  description "Get current weather"
+  param :latitude
+  param :longitude
+
+  def execute(latitude:, longitude:)
+    url = "https://api.open-meteo.com/v1/forecast?latitude=#{latitude}&longitude=#{longitude}&current=temperature_2m,wind_speed_10m"
+    JSON.parse(Faraday.get(url).body)
+  end
+end
+
+chat.with_tool(Weather).ask "What's the weather in Berlin?"
+```
+
+This works great for fixed actions, but if the agent needs to reason over data — filter, aggregate, compare — you'd need a new tool for every possible query. With Enclave, you expose one eval tool and let the agent write the logic:
+
+```ruby
+class CustomerConsole < RubyLLM::Tool
+  description "Run Ruby code in a sandboxed customer service console. " \
+              "Available functions: customer_info, orders, update_email(email), " \
+              "list_tickets, create_ticket(subject, body), update_ticket(id, fields)"
+
+  param :code, desc: "Ruby code to evaluate"
+
+  def execute(code:)
+    Enclave::Tool.call(@@enclave, code: code)
+  end
+
+  def self.connect(enclave)
+    @@enclave = enclave
+  end
+end
+
+enclave = Enclave.new(tools: CustomerServiceTools.new(customer))
+CustomerConsole.connect(enclave)
+
+chat = RubyLLM::Chat.new
+chat.with_tool(CustomerConsole)
+chat.ask "What's my total spend on shipped orders?"
+```
+
+The agent writes the code itself:
+
+```ruby
+orders().select { |o| o["status"] == "shipped" }.sum { |o| o["total"] }
+#=> 249.49
+```
+
+One tool, one round-trip, any question. See [`examples/rails.rb`](examples/rails.rb) for a complete working app.
+
 ## Safety
 
 If you run agent-generated code with `eval` in CRuby, the agent can do anything your app can do. Here's what happens when you try those same things inside the enclave:
