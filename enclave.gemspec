@@ -14,6 +14,10 @@ Gem::Specification.new do |spec|
   spec.files = Dir[
     "lib/**/*.rb",
     "ext/**/*.{c,h,rb}",
+    "ext/enclave/mruby/{Rakefile,Makefile}",
+    "ext/enclave/mruby/{include,src,mrblib,mrbgems}/**/*",
+    "ext/enclave/mruby/{build_config,tasks,lib}/**/*",
+    "ext/enclave/mruby/tools/lrama/**/*",
     "Rakefile",
     "README.md",
     "LICENSE"

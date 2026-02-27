@@ -9,7 +9,7 @@ mruby_build_dir = File.join(mruby_dir, "build", "host")
 # Build mruby from source
 unless File.exist?(File.join(mruby_build_dir, "lib", "libmruby.a"))
   puts "Building mruby..."
-  system("cd #{mruby_dir} && MRUBY_CONFIG=#{build_config} rake") || abort("mruby build failed")
+  system("cd #{mruby_dir} && MRUBY_CONFIG=#{build_config} rake -f #{mruby_dir}/Rakefile") || abort("mruby build failed")
 end
 
 # mruby headers (only used by sandbox_core.c, not enclave.c)
