@@ -1,7 +1,12 @@
 require_relative "enclave/version"
 require_relative "enclave/result"
 require_relative "enclave/tool"
-require_relative "enclave/enclave"
+begin
+  require_relative "enclave/enclave"
+rescue LoadError
+  raise LoadError,
+    "Enclave native extension not found. Run `rake compile` first (from a git clone, run `rake setup`)."
+end
 
 class Enclave
   class << self
