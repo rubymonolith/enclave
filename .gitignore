@@ -5,3 +5,4 @@ pkg/
 *.bundle
 Gemfile.lock
 ext/enclave/sandbox_build_config.rb.lock
+.env
