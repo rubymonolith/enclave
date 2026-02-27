@@ -7,7 +7,7 @@ Gem::Specification.new do |spec|
   spec.summary = "Sandboxed Ruby for AI agents"
   spec.description = "Embeds MRuby as an in-process sandboxed Ruby execution environment. " \
                      "Provides a stateful REPL interface for AI agents to send code and get back results."
-  spec.homepage = "https://github.com/bradgessler/enclave"
+  spec.homepage = "https://github.com/rubymonolith/enclave"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.1.0"
 
