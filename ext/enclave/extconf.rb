@@ -6,6 +6,18 @@ mruby_dir = File.join(ext_dir, "mruby")
 build_config = File.join(ext_dir, "sandbox_build_config.rb")
 mruby_build_dir = File.join(mruby_dir, "build", "host")
 
+# Check for mruby source (submodule may not be initialized after git clone)
+unless File.exist?(File.join(mruby_dir, "Rakefile"))
+  abort <<~MSG
+    mruby source not found at #{mruby_dir}
+
+    If you're developing from a git clone, initialize the submodule:
+
+      git submodule update --init
+
+  MSG
+end
+
 # Build mruby from source
 unless File.exist?(File.join(mruby_build_dir, "lib", "libmruby.a"))
   puts "Building mruby..."
