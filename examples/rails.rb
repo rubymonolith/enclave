@@ -8,9 +8,9 @@ gemfile do
   gem "sqlite3"
 end
 
-ENV.fetch("ANTHROPIC_API_KEY") do
+ENV["ANTHROPIC_API_KEY"] ||= ENV["ENCLAVE_ANTHROPIC_API_KEY"] || begin
   print "Anthropic API key: "
-  ENV["ANTHROPIC_API_KEY"] = gets.strip
+  gets.strip
 end
 
 # ── Database setup ──────────────────────────────────────────────────────────────
