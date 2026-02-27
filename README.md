@@ -251,6 +251,16 @@ Enclave blocks the LLM from accessing your system. It does **not** protect again
 
 **Tool functions run in your Ruby process.** When the LLM calls an exposed function, that function runs in CRuby with full access to your app. The enclave boundary only exists between the LLM's code and your code. Inside your tool methods, you're back in the real world. A tool method that calls `system()` gives the LLM `system()`.
 
+**Data exfiltration through your own tools.** If you expose both read and write tools, the LLM can move data between them. It reads a customer's credit card from one tool, then stuffs it into `create_ticket(subject, body)` where the body contains the card number. Both calls are legitimate. The enclave can't stop this because the LLM is using your tools exactly as designed. Be careful about what data you return from read methods when write methods are also exposed.
+
+**Thread safety.** MRuby is not thread-safe. If you're running Puma with multiple threads and share an enclave instance across requests, you'll get memory corruption. Use one enclave per request, or protect it with a mutex.
+
+**Don't reuse enclave instances across users.** State persists between evals. If you reuse an enclave across different users to save on init cost, user A's variables and method definitions are visible to user B's eval.
+
+**ReDoS.** MRuby supports regex. The LLM can write a catastrophic backtracking pattern like `/^(a+)+$/` against a long string and burn CPU. Same effect as `loop {}` but harder to spot.
+
+**Your API bill.** Nothing stops the LLM from deciding it needs 15 evals to answer one question. Each one is a round-trip through your LLM provider. Cap the number of tool call rounds in your chat loop.
+
 ## License
 
 MIT
