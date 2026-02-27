@@ -8,6 +8,11 @@
 #include <ruby.h>
 #include "sandbox_core.h"
 
+/* Error class statics */
+static VALUE cEnclaveError;
+static VALUE cEnclaveTimeoutError;
+static VALUE cEnclaveMemoryLimitError;
+
 /* ------------------------------------------------------------------ */
 /* sandbox_value_t <-> CRuby VALUE conversion                          */
 /* ------------------------------------------------------------------ */
@@ -276,12 +281,15 @@ enclave_alloc(VALUE klass)
 }
 
 static VALUE
-enclave_initialize(VALUE self)
+enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit)
 {
     rb_enclave_t *sb;
     TypedData_Get_Struct(self, rb_enclave_t, &enclave_data_type, sb);
 
-    sb->state = sandbox_state_new();
+    double timeout = NIL_P(rb_timeout) ? 0.0 : NUM2DBL(rb_timeout);
+    size_t memory_limit = NIL_P(rb_memory_limit) ? 0 : (size_t)NUM2ULL(rb_memory_limit);
+
+    sb->state = sandbox_state_new(timeout, memory_limit);
     if (!sb->state) {
         rb_raise(rb_eRuntimeError, "failed to initialize mruby enclave");
     }
@@ -321,6 +329,20 @@ enclave_eval(VALUE self, VALUE rb_code)
     const char *code = StringValueCStr(rb_code);
 
     sandbox_result_t result = sandbox_state_eval(sb->state, code);
+
+    /* Check for resource limit errors — raise instead of returning in Result */
+    if (result.error_kind == SANDBOX_ERROR_TIMEOUT) {
+        const char *msg = result.error ? result.error : "execution timeout exceeded";
+        VALUE exc_msg = rb_str_new_cstr(msg);
+        sandbox_result_free(&result);
+        rb_exc_raise(rb_exc_new_str(cEnclaveTimeoutError, exc_msg));
+    }
+    if (result.error_kind == SANDBOX_ERROR_MEMORY_LIMIT) {
+        const char *msg = result.error ? result.error : "memory limit exceeded";
+        VALUE exc_msg = rb_str_new_cstr(msg);
+        sandbox_result_free(&result);
+        rb_exc_raise(rb_exc_new_str(cEnclaveMemoryLimitError, exc_msg));
+    }
 
     VALUE value = result.value ? rb_str_new_cstr(result.value) : Qnil;
     VALUE output = result.output ? rb_str_new_cstr(result.output) : rb_str_new_cstr("");
@@ -380,8 +402,17 @@ Init_enclave(void)
 {
     VALUE cEnclave = rb_define_class("Enclave", rb_cObject);
 
+    /* Error class hierarchy */
+    cEnclaveError = rb_define_class_under(cEnclave, "Error", rb_eStandardError);
+    cEnclaveTimeoutError = rb_define_class_under(cEnclave, "TimeoutError", cEnclaveError);
+    cEnclaveMemoryLimitError = rb_define_class_under(cEnclave, "MemoryLimitError", cEnclaveError);
+
+    rb_gc_register_mark_object(cEnclaveError);
+    rb_gc_register_mark_object(cEnclaveTimeoutError);
+    rb_gc_register_mark_object(cEnclaveMemoryLimitError);
+
     rb_define_alloc_func(cEnclave, enclave_alloc);
-    rb_define_method(cEnclave, "_init",            enclave_initialize,      0);
+    rb_define_method(cEnclave, "_init",            enclave_initialize,      2);
     rb_define_method(cEnclave, "_eval",            enclave_eval,            1);
     rb_define_method(cEnclave, "_define_function", enclave_define_function, 1);
     rb_define_method(cEnclave, "reset!",           enclave_reset,           0);

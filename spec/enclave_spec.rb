@@ -279,19 +279,6 @@ RSpec.describe Enclave do
     end
 
     describe "internal tampering" do
-      it "survives nulling the sandbox state pointer" do
-        enclave.eval("$__sandbox_state__ = nil")
-        result = enclave.eval("1 + 1")
-        expect(result.value).to eq("2")
-      end
-
-      it "survives nulling the output buffer pointer" do
-        enclave.eval("$__sandbox_output_buf__ = nil")
-        enclave.eval('puts "test"')
-        result = enclave.eval("1 + 1")
-        expect(result.value).to eq("2")
-      end
-
       it "cannot redefine a tool to bypass the callback" do
         e = Enclave.new(tools: TestTools)
         e.eval('def double(n); "hacked"; end')
@@ -579,6 +566,209 @@ RSpec.describe Enclave do
       described_class.open(tools: TestTools) do |sb|
         result = sb.eval("double(100)")
         expect(result.value).to eq("200")
+      end
+    end
+  end
+
+  describe "timeout" do
+    it "raises TimeoutError on infinite loop" do
+      e = described_class.new(timeout: 0.5)
+      expect { e.eval("loop {}") }.to raise_error(Enclave::TimeoutError)
+      e.close
+    end
+
+    it "raises TimeoutError on long computation" do
+      e = described_class.new(timeout: 0.5)
+      expect { e.eval("i = 0; while true; i += 1; end") }.to raise_error(Enclave::TimeoutError)
+      e.close
+    end
+
+    it "does NOT raise when code finishes in time" do
+      e = described_class.new(timeout: 5)
+      result = e.eval("1 + 1")
+      expect(result.value).to eq("2")
+      expect(result.error?).to be false
+      e.close
+    end
+
+    it "enclave is usable after timeout" do
+      e = described_class.new(timeout: 0.5)
+      expect { e.eval("loop {}") }.to raise_error(Enclave::TimeoutError)
+      result = e.eval("1 + 1")
+      expect(result.value).to eq("2")
+      e.close
+    end
+
+    it "applies class-level default" do
+      begin
+        Enclave.timeout = 0.5
+        e = described_class.new
+        expect { e.eval("loop {}") }.to raise_error(Enclave::TimeoutError)
+        e.close
+      ensure
+        Enclave.timeout = nil
+      end
+    end
+
+    it "per-instance override works" do
+      begin
+        Enclave.timeout = 100
+        e = described_class.new(timeout: 0.5)
+        expect { e.eval("loop {}") }.to raise_error(Enclave::TimeoutError)
+        e.close
+      ensure
+        Enclave.timeout = nil
+      end
+    end
+
+    it "nil means unlimited" do
+      e = described_class.new(timeout: nil)
+      result = e.eval("1 + 1")
+      expect(result.value).to eq("2")
+      e.close
+    end
+  end
+
+  describe "memory_limit" do
+    it "raises MemoryLimitError on string bomb" do
+      e = described_class.new(memory_limit: 1_000_000)
+      expect { e.eval('"x" * 10_000_000') }.to raise_error(Enclave::MemoryLimitError)
+      e.close
+    end
+
+    it "raises MemoryLimitError on cumulative allocations" do
+      e = described_class.new(memory_limit: 1_000_000)
+      expect { e.eval('a = []; 100_000.times { a << ("x" * 100) }; a.length') }.to raise_error(Enclave::MemoryLimitError)
+      e.close
+    end
+
+    it "does NOT raise when allocation fits" do
+      e = described_class.new(memory_limit: 10_000_000)
+      result = e.eval('"x" * 1000')
+      expect(result.error?).to be false
+      e.close
+    end
+
+    it "enclave is usable after memory limit" do
+      e = described_class.new(memory_limit: 1_000_000)
+      expect { e.eval('"x" * 10_000_000') }.to raise_error(Enclave::MemoryLimitError)
+      result = e.eval("1 + 1")
+      expect(result.value).to eq("2")
+      e.close
+    end
+
+    it "applies class-level default" do
+      begin
+        Enclave.memory_limit = 1_000_000
+        e = described_class.new
+        expect { e.eval('"x" * 10_000_000') }.to raise_error(Enclave::MemoryLimitError)
+        e.close
+      ensure
+        Enclave.memory_limit = nil
+      end
+    end
+
+    it "per-instance override works" do
+      begin
+        Enclave.memory_limit = 100_000_000
+        e = described_class.new(memory_limit: 1_000_000)
+        expect { e.eval('"x" * 10_000_000') }.to raise_error(Enclave::MemoryLimitError)
+        e.close
+      ensure
+        Enclave.memory_limit = nil
+      end
+    end
+
+    it "nil means unlimited" do
+      e = described_class.new(memory_limit: nil)
+      result = e.eval("1 + 1")
+      expect(result.value).to eq("2")
+      e.close
+    end
+  end
+
+  describe "error classes" do
+    it "Enclave::Error inherits from StandardError" do
+      expect(Enclave::Error).to be < StandardError
+    end
+
+    it "Enclave::TimeoutError inherits from Enclave::Error" do
+      expect(Enclave::TimeoutError).to be < Enclave::Error
+    end
+
+    it "Enclave::MemoryLimitError inherits from Enclave::Error" do
+      expect(Enclave::MemoryLimitError).to be < Enclave::Error
+    end
+
+    it "TimeoutError is rescuable as Enclave::Error" do
+      e = described_class.new(timeout: 0.5)
+      expect { e.eval("loop {}") }.to raise_error(Enclave::Error)
+      e.close
+    end
+
+    it "MemoryLimitError is rescuable as Enclave::Error" do
+      e = described_class.new(memory_limit: 1_000_000)
+      expect { e.eval('"x" * 10_000_000') }.to raise_error(Enclave::Error)
+      e.close
+    end
+  end
+
+  describe "attr_readers" do
+    it "timeout returns configured value" do
+      e = described_class.new(timeout: 2.5)
+      expect(e.timeout).to eq(2.5)
+      e.close
+    end
+
+    it "memory_limit returns configured value" do
+      e = described_class.new(memory_limit: 5_000_000)
+      expect(e.memory_limit).to eq(5_000_000)
+      e.close
+    end
+
+    it "timeout returns nil when unlimited" do
+      e = described_class.new(timeout: nil)
+      expect(e.timeout).to be_nil
+      e.close
+    end
+
+    it "memory_limit returns nil when unlimited" do
+      e = described_class.new(memory_limit: nil)
+      expect(e.memory_limit).to be_nil
+      e.close
+    end
+  end
+
+  describe "combined limits" do
+    it "both limits set, normal eval works" do
+      e = described_class.new(timeout: 5, memory_limit: 10_000_000)
+      result = e.eval("1 + 1")
+      expect(result.value).to eq("2")
+      e.close
+    end
+
+    it "timeout fires with memory_limit also set" do
+      e = described_class.new(timeout: 0.5, memory_limit: 10_000_000)
+      expect { e.eval("loop {}") }.to raise_error(Enclave::TimeoutError)
+      e.close
+    end
+
+    it "memory limit fires with timeout also set" do
+      e = described_class.new(timeout: 5, memory_limit: 1_000_000)
+      expect { e.eval('"x" * 10_000_000') }.to raise_error(Enclave::MemoryLimitError)
+      e.close
+    end
+
+    it "limits persist through reset!" do
+      e = described_class.new(timeout: 0.5, memory_limit: 1_000_000)
+      e.reset!
+      expect { e.eval("loop {}") }.to raise_error(Enclave::TimeoutError)
+      e.close
+    end
+
+    it "works with .open" do
+      described_class.open(timeout: 0.5, memory_limit: 10_000_000) do |sb|
+        expect { sb.eval("loop {}") }.to raise_error(Enclave::TimeoutError)
       end
     end
   end

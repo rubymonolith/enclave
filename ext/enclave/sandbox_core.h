@@ -14,11 +14,20 @@
 /* Opaque handle */
 typedef struct sandbox_state sandbox_state_t;
 
+/* Error classification */
+typedef enum {
+    SANDBOX_ERROR_NONE,
+    SANDBOX_ERROR_RUNTIME,
+    SANDBOX_ERROR_TIMEOUT,
+    SANDBOX_ERROR_MEMORY_LIMIT
+} sandbox_error_kind_t;
+
 /* Result from an eval */
 typedef struct {
-    char *value;     /* inspected return value (NULL on error) */
-    char *output;    /* captured puts/print/p output */
-    char *error;     /* error message (NULL on success) */
+    char *value;                /* inspected return value (NULL on error) */
+    char *output;               /* captured puts/print/p output */
+    char *error;                /* error message (NULL on success) */
+    sandbox_error_kind_t error_kind;  /* classification of the error */
 } sandbox_result_t;
 
 /* ------------------------------------------------------------------ */
@@ -78,7 +87,7 @@ int sandbox_state_define_function(sandbox_state_t *state, const char *name);
 /* Core API                                                            */
 /* ------------------------------------------------------------------ */
 
-sandbox_state_t *sandbox_state_new(void);
+sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit);
 void             sandbox_state_free(sandbox_state_t *state);
 sandbox_result_t sandbox_state_eval(sandbox_state_t *state, const char *code);
 void             sandbox_state_reset(sandbox_state_t *state);

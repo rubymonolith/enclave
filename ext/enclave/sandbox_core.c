@@ -11,7 +11,6 @@
 #include <mruby/compile.h>
 #include <mruby/string.h>
 #include <mruby/proc.h>
-#include <mruby/variable.h>
 #include <mruby/error.h>
 #include <mruby/array.h>
 #include <mruby/hash.h>
@@ -22,6 +21,103 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <time.h>
+#include <math.h>
+
+/* ------------------------------------------------------------------ */
+/* Memory tracking allocator                                           */
+/* ------------------------------------------------------------------ */
+
+/* Header prepended to every allocation for size tracking.
+ * Aligned to max_align_t so the payload stays properly aligned. */
+#define MEM_HEADER_SIZE \
+    ((sizeof(size_t) + _Alignof(max_align_t) - 1) & ~(_Alignof(max_align_t) - 1))
+
+typedef struct {
+    size_t current;    /* current total bytes allocated */
+    size_t limit;      /* 0 = unlimited */
+    int    exceeded;   /* flag: set when limit was hit */
+} mem_tracker_t;
+
+static __thread mem_tracker_t *tl_mem_tracker = NULL;
+
+static mem_tracker_t *
+mem_tracker_activate(mem_tracker_t *tracker)
+{
+    mem_tracker_t *prev = tl_mem_tracker;
+    tl_mem_tracker = tracker;
+    return prev;
+}
+
+static void
+mem_tracker_restore(mem_tracker_t *prev)
+{
+    tl_mem_tracker = prev;
+}
+
+/* Override mrb_basic_alloc_func from mruby's allocf.c.
+ * Our object file is linked before libmruby.a, so this definition wins.
+ * ALWAYS prepends a size_t header for tracking. The tracker (when active)
+ * provides limit enforcement; headers are prepended regardless. */
+void *
+mrb_basic_alloc_func(void *ptr, size_t size)
+{
+    mem_tracker_t *tracker = tl_mem_tracker;
+
+    /* Free */
+    if (size == 0) {
+        if (ptr) {
+            char *hdr = (char *)ptr - MEM_HEADER_SIZE;
+            size_t old_size = *(size_t *)hdr;
+            if (tracker) tracker->current -= old_size;
+            free(hdr);
+        }
+        return NULL;
+    }
+
+    /* Malloc */
+    if (ptr == NULL) {
+        if (tracker && tracker->limit > 0 &&
+            (tracker->current + size) > tracker->limit) {
+            tracker->exceeded = 1;
+            return NULL; /* mruby will GC and retry, then raise NoMemoryError */
+        }
+        size_t total = MEM_HEADER_SIZE + size;
+        char *block = (char *)malloc(total);
+        if (!block) return NULL;
+        *(size_t *)block = size;
+        if (tracker) tracker->current += size;
+        return block + MEM_HEADER_SIZE;
+    }
+
+    /* Realloc */
+    {
+        char *old_hdr = (char *)ptr - MEM_HEADER_SIZE;
+        size_t old_size = *(size_t *)old_hdr;
+        if (tracker && tracker->limit > 0 &&
+            (tracker->current - old_size + size) > tracker->limit) {
+            tracker->exceeded = 1;
+            return NULL;
+        }
+        size_t total = MEM_HEADER_SIZE + size;
+        char *new_block = (char *)realloc(old_hdr, total);
+        if (!new_block) return NULL;
+        if (tracker) tracker->current = tracker->current - old_size + size;
+        *(size_t *)new_block = size;
+        return new_block + MEM_HEADER_SIZE;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Timeout state                                                       */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    struct timespec deadline;
+    int             expired;
+    unsigned int    check_counter;
+} timeout_state_t;
 
 /* ------------------------------------------------------------------ */
 /* Output capture buffer                                               */
@@ -94,11 +190,47 @@ struct sandbox_state {
     /* Registered function names (survive reset) */
     char *func_names[SANDBOX_MAX_FUNCTIONS];
     int   func_count;
+
+    /* Resource limits */
+    double          timeout_seconds;   /* 0 = unlimited */
+    size_t          memory_limit;      /* 0 = unlimited */
+    mem_tracker_t   mem_tracker;
+    timeout_state_t timeout_state;
 };
 
-/* Key for storing pointers in mruby globals */
-#define OUTPUT_BUF_KEY "$__sandbox_output_buf__"
-#define SANDBOX_STATE_KEY "$__sandbox_state__"
+/* ------------------------------------------------------------------ */
+/* Code fetch hook for timeout                                         */
+/* ------------------------------------------------------------------ */
+
+#define TIMEOUT_CHECK_INTERVAL 1024
+
+static void
+sandbox_code_fetch_hook(struct mrb_state *mrb, const struct mrb_irep *irep,
+                        const mrb_code *pc, mrb_value *regs)
+{
+    sandbox_state_t *state = (sandbox_state_t *)mrb->ud;
+    if (!state) return;
+
+    timeout_state_t *ts = &state->timeout_state;
+    if (ts->expired) return; /* already raised, avoid re-entry */
+
+    /* Only check clock every N instructions */
+    ts->check_counter++;
+    if (ts->check_counter < TIMEOUT_CHECK_INTERVAL) return;
+    ts->check_counter = 0;
+
+    /* Check if deadline is set (zero means no timeout) */
+    if (ts->deadline.tv_sec == 0 && ts->deadline.tv_nsec == 0) return;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (now.tv_sec > ts->deadline.tv_sec ||
+        (now.tv_sec == ts->deadline.tv_sec && now.tv_nsec >= ts->deadline.tv_nsec)) {
+        ts->expired = 1;
+        mrb_raise(mrb, mrb_class_get(mrb, "RuntimeError"), "execution timeout exceeded");
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* sandbox_value_t helpers                                             */
@@ -285,9 +417,7 @@ sandbox_value_to_mrb(mrb_state *mrb, const sandbox_value_t *val)
 static sandbox_state_t *
 get_sandbox_state(mrb_state *mrb)
 {
-    mrb_value gv = mrb_gv_get(mrb, mrb_intern_cstr(mrb, SANDBOX_STATE_KEY));
-    if (mrb_nil_p(gv)) return NULL;
-    return (sandbox_state_t *)mrb_cptr(gv);
+    return (sandbox_state_t *)mrb->ud;
 }
 
 static mrb_value
@@ -371,9 +501,9 @@ register_functions_in_mrb(sandbox_state_t *state)
 static output_buf_t *
 get_output_buf(mrb_state *mrb)
 {
-    mrb_value gv = mrb_gv_get(mrb, mrb_intern_cstr(mrb, OUTPUT_BUF_KEY));
-    if (mrb_nil_p(gv)) return NULL;
-    return (output_buf_t *)mrb_cptr(gv);
+    sandbox_state_t *state = (sandbox_state_t *)mrb->ud;
+    if (!state) return NULL;
+    return &state->output;
 }
 
 /* ------------------------------------------------------------------ */
@@ -466,14 +596,6 @@ sandbox_mrb_p(mrb_state *mrb, mrb_value self)
 static void
 sandbox_setup_mrb(sandbox_state_t *state)
 {
-    /* Store output buffer pointer in mruby global */
-    mrb_gv_set(state->mrb, mrb_intern_cstr(state->mrb, OUTPUT_BUF_KEY),
-               mrb_cptr_value(state->mrb, &state->output));
-
-    /* Store sandbox state pointer for trampoline access */
-    mrb_gv_set(state->mrb, mrb_intern_cstr(state->mrb, SANDBOX_STATE_KEY),
-               mrb_cptr_value(state->mrb, state));
-
     /* Override Kernel#print, define Kernel#puts, override Kernel#p */
     struct RClass *kernel = state->mrb->kernel_module;
     mrb_define_method(state->mrb, kernel, "print", sandbox_mrb_print, MRB_ARGS_ANY());
@@ -500,16 +622,31 @@ sandbox_setup_mrb(sandbox_state_t *state)
 /* ------------------------------------------------------------------ */
 
 sandbox_state_t *
-sandbox_state_new(void)
+sandbox_state_new(double timeout, size_t memory_limit)
 {
     sandbox_state_t *state = calloc(1, sizeof(sandbox_state_t));
     if (!state) return NULL;
 
+    state->timeout_seconds = timeout;
+    state->memory_limit = memory_limit;
+
+    /* Activate tracker with limit=0 (unlimited) during init so all
+     * allocations get the size header prepended. */
+    state->mem_tracker.current = 0;
+    state->mem_tracker.limit = 0;
+    state->mem_tracker.exceeded = 0;
+    mem_tracker_t *prev = mem_tracker_activate(&state->mem_tracker);
+
     state->mrb = mrb_open();
+
     if (!state->mrb || state->mrb->exc) {
+        mem_tracker_restore(prev);
         free(state);
         return NULL;
     }
+
+    /* Store sandbox_state in mrb->ud for the code_fetch_hook */
+    state->mrb->ud = state;
 
     state->cxt = mrb_ccontext_new(state->mrb);
     state->cxt->capture_errors = TRUE;
@@ -521,6 +658,8 @@ sandbox_state_new(void)
     output_buf_init(&state->output);
     sandbox_setup_mrb(state);
 
+    mem_tracker_restore(prev);
+
     return state;
 }
 
@@ -528,17 +667,80 @@ void
 sandbox_state_free(sandbox_state_t *state)
 {
     if (!state) return;
+
+    /* Activate tracker around mrb_close so frees go through our allocator */
+    state->mem_tracker.limit = 0; /* unlimited during teardown */
+    mem_tracker_t *prev = mem_tracker_activate(&state->mem_tracker);
+
     if (state->cxt && state->mrb) {
         mrb_ccontext_free(state->mrb, state->cxt);
     }
     if (state->mrb) {
         mrb_close(state->mrb);
     }
+
+    mem_tracker_restore(prev);
+
     output_buf_free(&state->output);
     for (int i = 0; i < state->func_count; i++) {
         free(state->func_names[i]);
     }
     free(state);
+}
+
+/* ------------------------------------------------------------------ */
+/* Limit orchestration helpers                                         */
+/* ------------------------------------------------------------------ */
+
+/* Activate limits before eval. Returns prev tracker for restore. */
+static mem_tracker_t *
+sandbox_limits_begin(sandbox_state_t *state)
+{
+    state->mem_tracker.exceeded = 0;
+    state->mem_tracker.limit = state->memory_limit;
+    mem_tracker_t *prev = mem_tracker_activate(&state->mem_tracker);
+
+    state->timeout_state.expired = 0;
+    state->timeout_state.check_counter = 0;
+    if (state->timeout_seconds > 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double int_part;
+        double frac = modf(state->timeout_seconds, &int_part);
+        state->timeout_state.deadline.tv_sec = now.tv_sec + (time_t)int_part;
+        state->timeout_state.deadline.tv_nsec = now.tv_nsec + (long)(frac * 1e9);
+        if (state->timeout_state.deadline.tv_nsec >= 1000000000L) {
+            state->timeout_state.deadline.tv_sec++;
+            state->timeout_state.deadline.tv_nsec -= 1000000000L;
+        }
+        state->mrb->code_fetch_hook = sandbox_code_fetch_hook;
+    } else {
+        state->timeout_state.deadline.tv_sec = 0;
+        state->timeout_state.deadline.tv_nsec = 0;
+        state->mrb->code_fetch_hook = NULL;
+    }
+
+    return prev;
+}
+
+/* Stop enforcing limits but keep tracker active for post-exec mruby calls. */
+static void
+sandbox_limits_end(sandbox_state_t *state)
+{
+    state->mrb->code_fetch_hook = NULL;
+    state->mem_tracker.limit = 0;
+}
+
+/* Classify error from flags, not string matching. */
+static sandbox_error_kind_t
+sandbox_classify_error(sandbox_state_t *state)
+{
+    if (state->timeout_state.expired) {
+        return SANDBOX_ERROR_TIMEOUT;
+    } else if (state->mem_tracker.exceeded) {
+        return SANDBOX_ERROR_MEMORY_LIMIT;
+    }
+    return SANDBOX_ERROR_RUNTIME;
 }
 
 static char *
@@ -555,14 +757,18 @@ strdup_safe(const char *s, size_t len)
 sandbox_result_t
 sandbox_state_eval(sandbox_state_t *state, const char *code)
 {
-    sandbox_result_t result = { NULL, NULL, NULL };
+    sandbox_result_t result = { NULL, NULL, NULL, SANDBOX_ERROR_NONE };
 
     output_buf_reset(&state->output);
+
+    mem_tracker_t *prev = sandbox_limits_begin(state);
 
     /* Parse */
     struct mrb_parser_state *parser = mrb_parser_new(state->mrb);
     if (!parser) {
+        mem_tracker_restore(prev);
         result.error = strdup_safe("parser allocation failed", 24);
+        result.error_kind = SANDBOX_ERROR_RUNTIME;
         result.output = strdup_safe("", 0);
         return result;
     }
@@ -579,8 +785,10 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
                  parser->error_buffer[0].message,
                  parser->error_buffer[0].lineno - state->cxt->lineno + 1);
         mrb_parser_free(parser);
+        mem_tracker_restore(prev);
 
         result.error = strdup_safe(errbuf, strlen(errbuf));
+        result.error_kind = SANDBOX_ERROR_RUNTIME;
         result.output = state->output.len > 0
             ? strdup_safe(state->output.buf, state->output.len)
             : strdup_safe("", 0);
@@ -592,7 +800,9 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
     mrb_parser_free(parser);
 
     if (!proc) {
+        mem_tracker_restore(prev);
         result.error = strdup_safe("code generation failed", 22);
+        result.error_kind = SANDBOX_ERROR_RUNTIME;
         result.output = state->output.len > 0
             ? strdup_safe(state->output.buf, state->output.len)
             : strdup_safe("", 0);
@@ -613,6 +823,8 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
                                        state->stack_keep);
     state->stack_keep = proc->body.irep->nlocals;
 
+    sandbox_limits_end(state);
+
     /* Collect output */
     result.output = state->output.len > 0
         ? strdup_safe(state->output.buf, state->output.len)
@@ -629,9 +841,13 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
         else {
             result.error = strdup_safe("unknown error", 13);
         }
+
+        result.error_kind = sandbox_classify_error(state);
+
         state->mrb->exc = NULL;
         mrb_gc_arena_restore(state->mrb, state->arena_idx);
         state->cxt->lineno++;
+        mem_tracker_restore(prev);
         return result;
     }
 
@@ -652,6 +868,7 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
 
     mrb_gc_arena_restore(state->mrb, state->arena_idx);
     state->cxt->lineno++;
+    mem_tracker_restore(prev);
 
     return result;
 }
@@ -660,6 +877,10 @@ void
 sandbox_state_reset(sandbox_state_t *state)
 {
     if (!state) return;
+
+    /* Activate tracker (unlimited) during teardown and recreate */
+    state->mem_tracker.limit = 0;
+    mem_tracker_t *prev = mem_tracker_activate(&state->mem_tracker);
 
     /* Tear down */
     if (state->cxt) {
@@ -672,9 +893,18 @@ sandbox_state_reset(sandbox_state_t *state)
     }
     output_buf_reset(&state->output);
 
-    /* Recreate */
+    /* Recreate with tracked allocator (limit=0 during init) */
+    state->mem_tracker.current = 0;
+    state->mem_tracker.exceeded = 0;
+
     state->mrb = mrb_open();
-    if (!state->mrb) return;
+
+    if (!state->mrb) {
+        mem_tracker_restore(prev);
+        return;
+    }
+
+    state->mrb->ud = state;
 
     state->cxt = mrb_ccontext_new(state->mrb);
     state->cxt->capture_errors = TRUE;
@@ -683,6 +913,8 @@ sandbox_state_reset(sandbox_state_t *state)
     state->arena_idx = mrb_gc_arena_save(state->mrb);
 
     sandbox_setup_mrb(state);
+
+    mem_tracker_restore(prev);
 }
 
 void
@@ -720,3 +952,4 @@ sandbox_state_define_function(sandbox_state_t *state, const char *name)
                       sandbox_function_trampoline, MRB_ARGS_ANY());
     return 0;
 }
+

@@ -4,14 +4,22 @@ require_relative "enclave/tool"
 require_relative "enclave/enclave"
 
 class Enclave
-  def initialize(tools: nil)
+  class << self
+    attr_accessor :timeout, :memory_limit
+  end
+
+  attr_reader :timeout, :memory_limit
+
+  def initialize(tools: nil, timeout: self.class.timeout, memory_limit: self.class.memory_limit)
     @tool_context = Object.new
-    _init
+    @timeout = timeout
+    @memory_limit = memory_limit
+    _init(@timeout, @memory_limit)
     expose(tools) if tools
   end
 
-  def self.open(tools: nil)
-    sandbox = new(tools: tools)
+  def self.open(tools: nil, timeout: self.timeout, memory_limit: self.memory_limit)
+    sandbox = new(tools: tools, timeout: timeout, memory_limit: memory_limit)
     begin
       yield sandbox
     ensure
