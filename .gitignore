@@ -1,7 +1,7 @@
 tmp/
-lib/ruby/llm/ruby_llm_sandbox.bundle
 pkg/
 *.o
 *.so
 *.bundle
 Gemfile.lock
+ext/enclave/sandbox_build_config.rb.lock
