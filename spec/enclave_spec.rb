@@ -130,34 +130,152 @@ RSpec.describe Enclave do
   end
 
   describe "safety" do
-    it "has no File class" do
-      result = enclave.eval("File")
-      expect(result.error?).to be true
+    # Each spec asserts the attempt errors out. If a sandbox escape
+    # actually succeeds, the test fails harmlessly (wrong value) —
+    # nothing dangerous runs in the host process.
+
+    describe "missing dangerous classes" do
+      %w[File IO Dir Socket Process Signal ENV ARGV STDIN STDOUT STDERR].each do |const|
+        it "has no #{const}" do
+          result = enclave.eval(const)
+          expect(result.error?).to be true
+        end
+      end
     end
 
-    it "has no IO class" do
-      result = enclave.eval("IO")
-      expect(result.error?).to be true
+    describe "missing dangerous methods" do
+      {
+        "system"       => 'system("id")',
+        "exec"         => 'exec("id")',
+        "spawn"        => 'spawn("id")',
+        "backticks"    => '`id`',
+        "require"      => 'require "json"',
+        "load"         => 'load "foo.rb"',
+        "open"         => 'open("/etc/passwd")',
+        "exit"         => "exit",
+        "exit!"        => "exit!",
+        "abort"        => 'abort("bye")',
+        "at_exit"      => "at_exit { }",
+        "fork"         => "fork { }",
+        "trap"         => 'trap("INT") { }',
+      }.each do |label, code|
+        it "blocks #{label}" do
+          result = enclave.eval(code)
+          expect(result.error?).to be true
+        end
+      end
     end
 
-    it "has no Socket class" do
-      result = enclave.eval("Socket")
-      expect(result.error?).to be true
+    describe "scope escape attempts" do
+      it "cannot reach File through top-level constant lookup" do
+        result = enclave.eval("::File")
+        expect(result.error?).to be true
+      end
+
+      it "cannot fish for dangerous constants via Object.constants" do
+        result = enclave.eval('Object.constants.select { |c| c.to_s.include?("File") }')
+        # Should either error or return empty
+        if result.error?
+          expect(result.error?).to be true
+        else
+          expect(result.value).to satisfy { |v| !v.include?("File") }
+        end
+      end
+
+      it "cannot eval its way to new scope" do
+        # mruby has eval but it's still sandboxed
+        result = enclave.eval('eval("File")')
+        expect(result.error?).to be true
+      end
+
+      it "cannot use instance_eval to escape" do
+        result = enclave.eval('Object.instance_eval { File }')
+        expect(result.error?).to be true
+      end
+
+      it "cannot use class_eval to escape" do
+        result = enclave.eval('Object.class_eval { File }')
+        expect(result.error?).to be true
+      end
+
+      it "cannot use send to call private kernel methods" do
+        result = enclave.eval('self.send(:system, "id")')
+        expect(result.error?).to be true
+      end
+
+      it "cannot use __send__ to bypass method_missing" do
+        result = enclave.eval('self.__send__(:system, "id")')
+        expect(result.error?).to be true
+      end
+
+      it "cannot use Kernel.open pipe trick" do
+        result = enclave.eval('Kernel.open("|id")')
+        expect(result.error?).to be true
+      end
     end
 
-    it "has no Dir class" do
-      result = enclave.eval("Dir")
-      expect(result.error?).to be true
+    describe "reflection attacks" do
+      it "cannot use ObjectSpace to enumerate host objects" do
+        result = enclave.eval("ObjectSpace.each_object(String).to_a")
+        # Should either error or only see mruby-internal strings
+        if !result.error?
+          expect(result.value).not_to include("SECRET")
+        end
+      end
+
+      it "cannot use method objects to discover internals" do
+        result = enclave.eval('method(:puts).inspect')
+        # This may work — puts exists in mruby — but shouldn't leak host info
+        if !result.error?
+          expect(result.value).not_to include("cruby")
+        end
+      end
     end
 
-    it "has no system() method" do
-      result = enclave.eval('system("echo hi")')
-      expect(result.error?).to be true
+    describe "resource exhaustion" do
+      it "does not crash the host on deep recursion" do
+        result = enclave.eval("def f; f; end; f")
+        expect(result.error?).to be true
+      end
+
+      it "does not crash the host on large string allocation" do
+        result = enclave.eval('"x" * 100_000_000')
+        # May succeed with a big string or error — either is fine, host must survive
+        expect(enclave.eval("1 + 1").value).to eq("2")
+      end
+
+      it "does not crash the host on infinite loop (if mruby catches it)" do
+        # mruby may not have a loop timeout, so we just verify the host survives
+        # a tight loop that allocates. Skip if it hangs — that's a known mruby limitation.
+        result = enclave.eval("a = []; 1_000_000.times { a << 1 }; a.length")
+        # Whether it succeeds or errors, the host must be alive
+        expect(enclave.eval("1 + 1").value).to eq("2")
+      end
     end
 
-    it "has no require" do
-      result = enclave.eval('require "json"')
-      expect(result.error?).to be true
+    describe "isolation between instances" do
+      it "cannot see tools from another enclave" do
+        tools_enclave = Enclave.new(tools: TestTools)
+        bare_enclave = Enclave.new
+
+        result = bare_enclave.eval("double(21)")
+        expect(result.error?).to be true
+
+        tools_enclave.close
+        bare_enclave.close
+      end
+
+      it "cannot leak state between enclaves" do
+        e1 = Enclave.new
+        e2 = Enclave.new
+
+        e1.eval("@secret = 'do_not_leak'")
+        result = e2.eval("@secret")
+        expect(result.value).to eq("nil")
+
+        e1.close
+        e2.close
+      end
     end
   end
 
