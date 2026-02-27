@@ -19,6 +19,9 @@ $INCFLAGS << " -I#{File.join(mruby_build_dir, 'include')}"
 # Include the ext dir for sandbox_core.h
 $INCFLAGS << " -I#{ext_dir}"
 
+# Must match the defines used when building mruby
+$CFLAGS << " -DMRB_USE_DEBUG_HOOK"
+
 # Both .c files in the extension directory
 $srcs = [
   File.join(ext_dir, "enclave.c"),
