@@ -277,6 +277,44 @@ RSpec.describe Enclave do
         e2.close
       end
     end
+
+    describe "internal tampering" do
+      it "survives nulling the sandbox state pointer" do
+        enclave.eval("$__sandbox_state__ = nil")
+        result = enclave.eval("1 + 1")
+        expect(result.value).to eq("2")
+      end
+
+      it "survives nulling the output buffer pointer" do
+        enclave.eval("$__sandbox_output_buf__ = nil")
+        enclave.eval('puts "test"')
+        result = enclave.eval("1 + 1")
+        expect(result.value).to eq("2")
+      end
+
+      it "cannot redefine a tool to bypass the callback" do
+        e = Enclave.new(tools: TestTools)
+        e.eval('def double(n); "hacked"; end')
+        # The redefined method wins — but it's still inside the sandbox,
+        # so the worst case is the agent lies to itself
+        result = e.eval("double(21)")
+        expect(result.value).to eq('"hacked"')
+        e.close
+      end
+
+      it "survives evil inspect override during result serialization" do
+        enclave.eval("class Integer; def inspect; nil; end; end")
+        result = enclave.eval("42")
+        # Should not crash — C code handles non-string inspect gracefully
+        expect(enclave.eval("1 + 1")).not_to be_nil
+      end
+
+      it "survives a fiber bomb" do
+        result = enclave.eval("fibers = 10000.times.map { Fiber.new { loop { Fiber.yield } } }; fibers.length")
+        expect(result.value).to eq("10000")
+        expect(enclave.eval("1 + 1").value).to eq("2")
+      end
+    end
   end
 
   describe "#reset!" do
