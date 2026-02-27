@@ -125,7 +125,10 @@ class CustomerServiceConsole < RubyLLM::Tool
   param :code, desc: "Ruby code to evaluate"
 
   def execute(code:)
-    Enclave::Tool.call(@@enclave, code: code)
+    puts "\n\e[2m  enclave> #{code.gsub("\n", "\n  enclave> ")}"
+    result = Enclave::Tool.call(@@enclave, code: code)
+    puts "       => #{result}\e[0m"
+    result.force_encoding("UTF-8")
   end
 
   def self.connect(enclave)
@@ -169,6 +172,7 @@ PROMPT
 
 # ── Interactive chat loop ───────────────────────────────────────────────────────
 
+puts
 puts "Customer Service Agent (serving: #{customer.name})"
 puts "Type 'help' to see what you can ask, or 'exit' to quit."
 puts
@@ -186,7 +190,7 @@ HELP = <<~HELP
 HELP
 
 loop do
-  print "You: "
+  print "🧑: "
   input = gets&.strip
   break if input.nil? || input.downcase == "exit"
   next if input.empty?
@@ -196,7 +200,7 @@ loop do
   end
 
   response = chat.ask(input)
-  puts "\nAgent: #{response.content}\n\n"
+  puts "\n🤖: #{response.content}\n\n"
 end
 
 enclave.close
