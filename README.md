@@ -1,4 +1,4 @@
-# Ruby LLM Sandbox
+# Enclave
 
 ## Why this exists
 
@@ -14,7 +14,7 @@ orders().select { |o| o["status"] == "shipped" }.sum { |o| o["total"] }
 
 The problem is obvious: `eval` in your Ruby process is catastrophic. The agent can do anything your app can do — `User.destroy_all`, `File.read("/etc/passwd")`, `ENV["SECRET_KEY_BASE"]`, `system("curl attacker.com")`. One prompt injection in a ticket body and you're done.
 
-This gem gives you `eval` without the blast radius. It embeds a separate MRuby VM — an isolated Ruby interpreter with no file system, no network, no access to your CRuby runtime. You expose specific functions into it. The agent writes code against those functions and nothing else.
+Enclave gives you `eval` without the blast radius. It embeds a separate MRuby VM — an isolated Ruby interpreter with no file system, no network, no access to your CRuby runtime. You expose specific functions into it. The agent writes code against those functions and nothing else.
 
 ```ruby
 class CustomerServiceTools
@@ -40,10 +40,10 @@ class CustomerServiceTools
 end
 
 user = User.find(params[:user_id])
-sandbox = Ruby::LLM::Sandbox.new(tools: CustomerServiceTools.new(user))
+enclave = Enclave.new(tools: CustomerServiceTools.new(user))
 ```
 
-Inside the sandbox, the agent sees these functions and nothing else:
+Inside the enclave, the agent sees these functions and nothing else:
 
 ```ruby
 user_info()
@@ -57,16 +57,16 @@ open_tickets.length
 #=> 3
 ```
 
-There's no `User` class in the sandbox. No ActiveRecord. No file system. No network. The agent can only call the methods you gave it, scoped to the user you passed in.
+There's no `User` class in the enclave. No ActiveRecord. No file system. No network. The agent can only call the methods you gave it, scoped to the user you passed in.
 
 ### Do you actually need this?
 
 If your agent only needs to pick from a fixed menu of actions — "cancel order", "send refund", "update email" — standard tool calling is fine. Each tool is a function the LLM selects; you control the surface area; there's no code execution to worry about.
 
-The sandbox becomes worth it when:
+Enclave becomes worth it when:
 
 - **The agent needs to reason over data.** Filter, sort, aggregate, compare. Instead of building a tool for every possible query, you expose the raw data and let the agent write the logic.
-- **You want fewer round-trips.** One sandbox eval can fetch data, process it, and return a result. That's one LLM turn instead of three or four.
+- **You want fewer round-trips.** One eval can fetch data, process it, and return a result. That's one LLM turn instead of three or four.
 - **You can't predict the questions.** Customer service, data exploration, internal dashboards — anywhere users ask ad-hoc questions about their own data.
 
 ## Installation
@@ -74,7 +74,7 @@ The sandbox becomes worth it when:
 Add to your Gemfile:
 
 ```ruby
-gem "ruby-llm-sandbox"
+gem "enclave"
 ```
 
 The gem builds MRuby from source on first compile, so the initial `bundle install` takes a moment.
@@ -114,18 +114,18 @@ class OrderTools
   end
 end
 
-sandbox = Ruby::LLM::Sandbox.new(tools: OrderTools.new(order))
+enclave = Enclave.new(tools: OrderTools.new(order))
 ```
 
 ### Multiple tool objects
 
 ```ruby
-sandbox = Ruby::LLM::Sandbox.new(tools: AccountTools.new(user))
-sandbox.expose(BillingTools.new(user.billing_account))
-sandbox.expose(NotificationTools.new(user))
+enclave = Enclave.new(tools: AccountTools.new(user))
+enclave.expose(BillingTools.new(user.billing_account))
+enclave.expose(NotificationTools.new(user))
 ```
 
-All methods from all exposed objects are available as functions in the sandbox.
+All methods from all exposed objects are available as functions in the enclave.
 
 ### Allowed types
 
@@ -150,32 +150,32 @@ This means you need to serialize your data into hashes — which is a feature, n
 
 ### Error handling
 
-Exceptions in your tool methods are caught and returned as errors. The sandbox keeps running:
+Exceptions in your tool methods are caught and returned as errors. The enclave keeps running:
 
 ```ruby
-# Inside the sandbox:
+# Inside the enclave:
 apply_discount(99)   #=> RuntimeError: discount must be 1-50%
 details()            # still works
 ```
 
 ## Safety
 
-If you run agent-generated code with `eval` in CRuby, the agent can do anything your app can do. Here's what happens when you try those same things inside the sandbox:
+If you run agent-generated code with `eval` in CRuby, the agent can do anything your app can do. Here's what happens when you try those same things inside the enclave:
 
 ```ruby
-sandbox.eval('File.read("/etc/passwd")')
+enclave.eval('File.read("/etc/passwd")')
 #=> NameError: uninitialized constant File
 
-sandbox.eval('ENV["SECRET_KEY_BASE"]')
+enclave.eval('ENV["SECRET_KEY_BASE"]')
 #=> NameError: uninitialized constant ENV
 
-sandbox.eval('`curl http://attacker.com`')
+enclave.eval('`curl http://attacker.com`')
 #=> NotImplementedError: backquotes not implemented
 ```
 
 These aren't runtime permission checks — the classes and methods simply don't exist. MRuby is a separate interpreter compiled without IO, network, or process modules. There's nothing to bypass.
 
-Each sandbox instance is fully isolated from other instances.
+Each enclave instance is fully isolated from other instances.
 
 ## License
 

@@ -2,7 +2,7 @@ require "bundler/inline"
 
 gemfile do
   source "https://rubygems.org"
-  gem "ruby-llm-sandbox", path: ".."
+  gem "enclave", path: ".."
   gem "ruby_llm"
   gem "activerecord", require: "active_record"
   gem "sqlite3"
@@ -125,19 +125,19 @@ class CustomerServiceConsole < RubyLLM::Tool
   param :code, desc: "Ruby code to evaluate"
 
   def execute(code:)
-    Ruby::LLM::Sandbox::Tool.call(@@sandbox, code: code)
+    Enclave::Tool.call(@@enclave, code: code)
   end
 
-  def self.connect(sandbox)
-    @@sandbox = sandbox
+  def self.connect(enclave)
+    @@enclave = enclave
   end
 end
 
 # ── Wire it all up ──────────────────────────────────────────────────────────────
 
 customer = Customer.find(1)
-sandbox = Ruby::LLM::Sandbox.new(tools: CustomerServiceTools.new(customer))
-CustomerServiceConsole.connect(sandbox)
+enclave = Enclave.new(tools: CustomerServiceTools.new(customer))
+CustomerServiceConsole.connect(enclave)
 
 RubyLLM.configure do |config|
   config.anthropic_api_key = ENV["ANTHROPIC_API_KEY"]
@@ -199,7 +199,7 @@ loop do
   puts "\nAgent: #{response.content}\n\n"
 end
 
-sandbox.close
+enclave.close
 puts "Goodbye!"
 
 __END__

@@ -1,5 +1,5 @@
 /*
- * ruby_llm_sandbox.c — Ruby C extension wrapper
+ * enclave.c — Ruby C extension wrapper
  *
  * This file ONLY includes ruby.h, never mruby.h.
  * All mruby interaction goes through the opaque sandbox_core.h API.
@@ -9,10 +9,10 @@
 #include "sandbox_core.h"
 
 /* ------------------------------------------------------------------ */
-/* sandbox_value_t ↔ CRuby VALUE conversion                          */
+/* sandbox_value_t <-> CRuby VALUE conversion                          */
 /* ------------------------------------------------------------------ */
 
-/* Convert sandbox_value_t → CRuby VALUE */
+/* Convert sandbox_value_t -> CRuby VALUE */
 static VALUE
 sandbox_value_to_rb(const sandbox_value_t *val)
 {
@@ -49,7 +49,7 @@ sandbox_value_to_rb(const sandbox_value_t *val)
     return Qnil;
 }
 
-/* Convert CRuby VALUE → sandbox_value_t. Returns 0 on success, -1 on bad type. */
+/* Convert CRuby VALUE -> sandbox_value_t. Returns 0 on success, -1 on bad type. */
 static int
 rb_to_sandbox_value(VALUE v, sandbox_value_t *out, char *errbuf, size_t errbuf_size)
 {
@@ -86,7 +86,7 @@ rb_to_sandbox_value(VALUE v, sandbox_value_t *out, char *errbuf, size_t errbuf_s
         return 0;
     }
     if (RB_TYPE_P(v, T_SYMBOL)) {
-        /* Symbol → String */
+        /* Symbol -> String */
         VALUE s = rb_sym2str(v);
         out->type = SANDBOX_VALUE_STRING;
         out->as.str.len = (size_t)RSTRING_LEN(s);
@@ -175,7 +175,7 @@ sandbox_cruby_callback(const char *method_name,
 
     VALUE self = (VALUE)userdata;
 
-    /* Convert sandbox args → CRuby VALUEs */
+    /* Convert sandbox args -> CRuby VALUEs */
     VALUE *rb_args = NULL;
     if (argc > 0) {
         rb_args = ALLOCA_N(VALUE, argc);
@@ -198,7 +198,7 @@ sandbox_cruby_callback(const char *method_name,
     VALUE ret = rb_protect(cruby_protected_call, (VALUE)&ca, &state);
 
     if (state) {
-        /* Exception was raised — capture message */
+        /* Exception was raised -- capture message */
         VALUE exc = rb_errinfo();
         rb_set_errinfo(Qnil);
         VALUE exc_str = rb_funcall(exc, rb_intern("inspect"), 0);
@@ -207,7 +207,7 @@ sandbox_cruby_callback(const char *method_name,
         return result;
     }
 
-    /* Convert CRuby return → sandbox_value_t */
+    /* Convert CRuby return -> sandbox_value_t */
     char errbuf[256];
     errbuf[0] = '\0';
     if (rb_to_sandbox_value(ret, &result.value, errbuf, sizeof(errbuf)) != 0) {
@@ -219,18 +219,18 @@ sandbox_cruby_callback(const char *method_name,
 }
 
 /* ------------------------------------------------------------------ */
-/* TypedData for Sandbox                                               */
+/* TypedData for Enclave                                               */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
     sandbox_state_t *state;
     int              closed;
-} rb_sandbox_t;
+} rb_enclave_t;
 
 static void
-rb_sandbox_free(void *ptr)
+rb_enclave_free(void *ptr)
 {
-    rb_sandbox_t *sb = (rb_sandbox_t *)ptr;
+    rb_enclave_t *sb = (rb_enclave_t *)ptr;
     if (sb) {
         if (sb->state) {
             sandbox_state_free(sb->state);
@@ -241,49 +241,49 @@ rb_sandbox_free(void *ptr)
 }
 
 static size_t
-rb_sandbox_memsize(const void *ptr)
+rb_enclave_memsize(const void *ptr)
 {
-    return sizeof(rb_sandbox_t);
+    return sizeof(rb_enclave_t);
 }
 
-static const rb_data_type_t sandbox_data_type = {
-    "Ruby::LLM::Sandbox",
-    { NULL, rb_sandbox_free, rb_sandbox_memsize },
+static const rb_data_type_t enclave_data_type = {
+    "Enclave",
+    { NULL, rb_enclave_free, rb_enclave_memsize },
     NULL, NULL,
     RUBY_TYPED_FREE_IMMEDIATELY
 };
 
-static rb_sandbox_t *
-get_sandbox(VALUE self)
+static rb_enclave_t *
+get_enclave(VALUE self)
 {
-    rb_sandbox_t *sb;
-    TypedData_Get_Struct(self, rb_sandbox_t, &sandbox_data_type, sb);
+    rb_enclave_t *sb;
+    TypedData_Get_Struct(self, rb_enclave_t, &enclave_data_type, sb);
     if (sb->closed) {
-        rb_raise(rb_eRuntimeError, "sandbox is closed");
+        rb_raise(rb_eRuntimeError, "enclave is closed");
     }
     return sb;
 }
 
 /* ------------------------------------------------------------------ */
-/* Sandbox#initialize                                                  */
+/* Enclave#initialize                                                  */
 /* ------------------------------------------------------------------ */
 
 static VALUE
-sandbox_alloc(VALUE klass)
+enclave_alloc(VALUE klass)
 {
-    rb_sandbox_t *sb = calloc(1, sizeof(rb_sandbox_t));
-    return TypedData_Wrap_Struct(klass, &sandbox_data_type, sb);
+    rb_enclave_t *sb = calloc(1, sizeof(rb_enclave_t));
+    return TypedData_Wrap_Struct(klass, &enclave_data_type, sb);
 }
 
 static VALUE
-sandbox_initialize(VALUE self)
+enclave_initialize(VALUE self)
 {
-    rb_sandbox_t *sb;
-    TypedData_Get_Struct(self, rb_sandbox_t, &sandbox_data_type, sb);
+    rb_enclave_t *sb;
+    TypedData_Get_Struct(self, rb_enclave_t, &enclave_data_type, sb);
 
     sb->state = sandbox_state_new();
     if (!sb->state) {
-        rb_raise(rb_eRuntimeError, "failed to initialize mruby sandbox");
+        rb_raise(rb_eRuntimeError, "failed to initialize mruby enclave");
     }
     sb->closed = 0;
 
@@ -294,13 +294,13 @@ sandbox_initialize(VALUE self)
 }
 
 /* ------------------------------------------------------------------ */
-/* Sandbox#_define_function                                            */
+/* Enclave#_define_function                                            */
 /* ------------------------------------------------------------------ */
 
 static VALUE
-sandbox_define_function(VALUE self, VALUE rb_name)
+enclave_define_function(VALUE self, VALUE rb_name)
 {
-    rb_sandbox_t *sb = get_sandbox(self);
+    rb_enclave_t *sb = get_enclave(self);
     const char *name = StringValueCStr(rb_name);
 
     if (sandbox_state_define_function(sb->state, name) != 0) {
@@ -311,13 +311,13 @@ sandbox_define_function(VALUE self, VALUE rb_name)
 }
 
 /* ------------------------------------------------------------------ */
-/* Sandbox#_eval                                                       */
+/* Enclave#_eval                                                       */
 /* ------------------------------------------------------------------ */
 
 static VALUE
-sandbox_eval(VALUE self, VALUE rb_code)
+enclave_eval(VALUE self, VALUE rb_code)
 {
-    rb_sandbox_t *sb = get_sandbox(self);
+    rb_enclave_t *sb = get_enclave(self);
     const char *code = StringValueCStr(rb_code);
 
     sandbox_result_t result = sandbox_state_eval(sb->state, code);
@@ -332,26 +332,26 @@ sandbox_eval(VALUE self, VALUE rb_code)
 }
 
 /* ------------------------------------------------------------------ */
-/* Sandbox#reset!                                                      */
+/* Enclave#reset!                                                      */
 /* ------------------------------------------------------------------ */
 
 static VALUE
-sandbox_reset(VALUE self)
+enclave_reset(VALUE self)
 {
-    rb_sandbox_t *sb = get_sandbox(self);
+    rb_enclave_t *sb = get_enclave(self);
     sandbox_state_reset(sb->state);
     return self;
 }
 
 /* ------------------------------------------------------------------ */
-/* Sandbox#close                                                       */
+/* Enclave#close                                                       */
 /* ------------------------------------------------------------------ */
 
 static VALUE
-sandbox_close(VALUE self)
+enclave_close(VALUE self)
 {
-    rb_sandbox_t *sb;
-    TypedData_Get_Struct(self, rb_sandbox_t, &sandbox_data_type, sb);
+    rb_enclave_t *sb;
+    TypedData_Get_Struct(self, rb_enclave_t, &enclave_data_type, sb);
 
     if (!sb->closed) {
         if (sb->state) {
@@ -364,10 +364,10 @@ sandbox_close(VALUE self)
 }
 
 static VALUE
-sandbox_closed_p(VALUE self)
+enclave_closed_p(VALUE self)
 {
-    rb_sandbox_t *sb;
-    TypedData_Get_Struct(self, rb_sandbox_t, &sandbox_data_type, sb);
+    rb_enclave_t *sb;
+    TypedData_Get_Struct(self, rb_enclave_t, &enclave_data_type, sb);
     return sb->closed ? Qtrue : Qfalse;
 }
 
@@ -376,17 +376,15 @@ sandbox_closed_p(VALUE self)
 /* ------------------------------------------------------------------ */
 
 void
-Init_ruby_llm_sandbox(void)
+Init_enclave(void)
 {
-    VALUE mRuby = rb_define_module("Ruby");
-    VALUE mLLM  = rb_define_module_under(mRuby, "LLM");
-    VALUE cSandbox = rb_define_class_under(mLLM, "Sandbox", rb_cObject);
+    VALUE cEnclave = rb_define_class("Enclave", rb_cObject);
 
-    rb_define_alloc_func(cSandbox, sandbox_alloc);
-    rb_define_method(cSandbox, "_init",            sandbox_initialize,      0);
-    rb_define_method(cSandbox, "_eval",            sandbox_eval,            1);
-    rb_define_method(cSandbox, "_define_function", sandbox_define_function, 1);
-    rb_define_method(cSandbox, "reset!",           sandbox_reset,           0);
-    rb_define_method(cSandbox, "close",            sandbox_close,           0);
-    rb_define_method(cSandbox, "closed?",          sandbox_closed_p,        0);
+    rb_define_alloc_func(cEnclave, enclave_alloc);
+    rb_define_method(cEnclave, "_init",            enclave_initialize,      0);
+    rb_define_method(cEnclave, "_eval",            enclave_eval,            1);
+    rb_define_method(cEnclave, "_define_function", enclave_define_function, 1);
+    rb_define_method(cEnclave, "reset!",           enclave_reset,           0);
+    rb_define_method(cEnclave, "close",            enclave_close,           0);
+    rb_define_method(cEnclave, "closed?",          enclave_closed_p,        0);
 }

@@ -12,7 +12,7 @@ unless File.exist?(File.join(mruby_build_dir, "lib", "libmruby.a"))
   system("cd #{mruby_dir} && MRUBY_CONFIG=#{build_config} rake") || abort("mruby build failed")
 end
 
-# mruby headers (only used by sandbox_core.c, not ruby_llm_sandbox.c)
+# mruby headers (only used by sandbox_core.c, not enclave.c)
 $INCFLAGS << " -I#{File.join(mruby_dir, 'include')}"
 $INCFLAGS << " -I#{File.join(mruby_build_dir, 'include')}"
 
@@ -21,7 +21,7 @@ $INCFLAGS << " -I#{ext_dir}"
 
 # Both .c files in the extension directory
 $srcs = [
-  File.join(ext_dir, "ruby_llm_sandbox.c"),
+  File.join(ext_dir, "enclave.c"),
   File.join(ext_dir, "sandbox_core.c")
 ]
 
@@ -30,4 +30,4 @@ $LDFLAGS << " -L#{File.join(mruby_build_dir, 'lib')}"
 $libs << " #{File.join(mruby_build_dir, 'lib', 'libmruby.a')}"
 $libs << " -lm"
 
-create_makefile("ruby/llm/ruby_llm_sandbox")
+create_makefile("enclave/enclave")

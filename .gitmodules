@@ -1,3 +1,3 @@
-[submodule "ext/ruby_llm_sandbox/mruby"]
-	path = ext/ruby_llm_sandbox/mruby
+[submodule "ext/enclave/mruby"]
+	path = ext/enclave/mruby
 	url = https://github.com/mruby/mruby.git
