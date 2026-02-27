@@ -25,8 +25,6 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.extensions = ["ext/enclave/extconf.rb"]
 
-  spec.post_install_message = "Enclave installed! Sandboxed Ruby for AI agents is ready to go."
-
   spec.add_dependency "rake-compiler", "~> 1.2"
 
   spec.add_development_dependency "rspec", "~> 3.0"
